@@ -1,55 +1,37 @@
 import torch
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from torch.utils.data import Dataset
 
 class MNISTDataset(Dataset):
     def __init__(self, csv_file, is_test=False, transform=None):
-        # 1. On charge le CSV avec Pandas
+        print(f"⌛ Chargement et conversion de {csv_file}...")
         df = pd.read_csv(csv_file)
-        
         self.is_test = is_test
         self.transform = transform
-
+        
         if not is_test:
-            # Pour l'entraînement : la colonne 0 est le chiffre (le label)
-            self.y = df.iloc[:, 0].values
-            # Les autres colonnes sont les 784 pixels
-            self.x = df.iloc[:, 1:].values.astype('float32')
+            # On stocke tout en Tenseur directement
+            self.y = torch.tensor(df.iloc[:, 0].values, dtype=torch.long)
+            self.x = torch.tensor(df.iloc[:, 1:].values.astype('float32') / 255.0)
         else:
-            # Pour le test Kaggle : il n'y a pas de colonne label
-            self.x = df.values.astype('float32')
+            self.x = torch.tensor(df.values.astype('float32') / 255.0)
             self.y = None
-            
-        # 2. Normalisation (comme tu l'avais fait en NumPy)
-        # On passe de [0, 255] à [0, 1]
-        self.x = self.x / 255.0
+        
+        del df # Libère la mémoire
+        print("✅ Données prêtes en RAM.")
 
     def __len__(self):
-        # On dit à PyTorch combien il y a d'images au total
         return len(self.x)
 
     def __getitem__(self, idx):
-        # C'est ici qu'on récupère UNE image précise
+        # On récupère le tenseur (C, H, W)
+        image = self.x[idx].reshape(1, 28, 28)
         
-        # On transforme la ligne de pixels en Tenseur PyTorch
-        # Note : On reshape en (1, 28, 28) car c'est une image Noir & Blanc (1 canal)
-        image = torch.tensor(self.x[idx]).reshape(1, 28, 28)
-        
+        # On applique la transformation directement sur le tenseur
         if self.transform:
-            # Remplace : image = torch.tensor(image)
-            # Par ceci :
-            image = torch.as_tensor(image).clone().detach()
             image = self.transform(image)
-        else:
-            # Remplace : image = torch.tensor(image)
-            # Par ceci :
-            image = torch.as_tensor(image).clone().detach()
-        
+            
         if not self.is_test:
-            label = torch.tensor(self.y[idx], dtype=torch.long)
-            return image, label
-        else:
-            return image
+            return image, self.y[idx]
+        return image
