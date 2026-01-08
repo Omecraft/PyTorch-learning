@@ -15,16 +15,19 @@ class MNISTCNN(nn.Module):
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
         
-        # 3. Le MaxPool : Il divise la taille par 2 en ne gardant que le pixel le plus fort
-        # Ça permet de dire : "La boucle est là, peu importe sa position exacte"
+        # 3. On cherche 128 motifs encore plus complexes
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm2d(128)
+        
+        # Le MaxPool : Il divise la taille par 2
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
         self.dropout = nn.Dropout(0.25)
         # --- PARTIE 2 : CLASSIFICATEUR (LINEAR) ---
         
-        # Après 2 MaxPool, l'image 28x28 est devenue 7x7 (28 -> 14 -> 7)
-        # On a 64 filtres de taille 7x7
-        self.fc1 = nn.Linear(64 * 7 * 7, 128)
-        self.fc2 = nn.Linear(128, 10)
+        # Après 3 MaxPools : 28 -> 14 -> 7 -> 3
+        # On a 128 filtres de taille 3x3
+        self.fc1 = nn.Linear(128 * 3 * 3, 256) # Augmenté à 256 neurones
+        self.fc2 = nn.Linear(256, 10)
 
     def forward(self, x):
         # x arrive en (Batch, 1, 28, 28)
@@ -35,8 +38,11 @@ class MNISTCNN(nn.Module):
         # Bloc 2 : Conv -> ReLU -> Pool
         x = self.pool(F.relu(self.bn2(self.conv2(x)))) # Devient (Batch, 64, 7, 7)
         
+        # Bloc 3 : Conv -> ReLU -> Pool
+        x = self.pool(F.relu(self.bn3(self.conv3(x)))) # Devient (Batch, 128, 3, 3)
+        
         # On "aplatit" (Flatten) seulement ici pour entrer dans les couches Linear
-        x = x.view(-1, 64 * 7 * 7)
+        x = x.view(-1, 128 * 3 * 3)
         x = self.dropout(F.relu(self.fc1(x)))
         x = self.fc2(x)
         

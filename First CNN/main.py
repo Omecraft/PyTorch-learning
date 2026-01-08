@@ -2,7 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import DataLoader, Subset, ConcatDataset
 from torchvision import transforms
 import tqdm
 import pandas as pd
@@ -82,22 +83,40 @@ def visualize_errors(train_ds, device, num_experts=10):
 
 # --- TES FONCTIONS EXISTANTES (GARDÉES TELLES QUELLES) ---
 
-def train_experts_kfold(train_ds, device, num_experts=10, epochs=50):
-    # ... (ton code actuel reste identique)
+def train_experts_kfold(train_ds, device, num_experts=10, epochs=50, pseudo_ds=None):
     indices = np.arange(len(train_ds))
     np.random.seed(42) 
     np.random.shuffle(indices)
     folds = np.array_split(indices, num_experts)
 
+    # --- Optimisation 1 : Gros Batch Size (pour le GPU) ---
+    BATCH_SIZE = 1024 
+
+    # --- Optimisation 2 : Mix  ed Precision (AMP) ---
+    scaler = torch.amp.GradScaler('cuda') 
+
     for i in range(num_experts):
         val_idx = folds[i]
         train_idx = np.concatenate([folds[j] for j in range(num_experts) if j != i])
         
+        # Création du Dataset d'entraînement pour cet expert
+        ds_train_fold = Subset(train_ds, train_idx)
+        
+        # --- Stratégie V2 : Injection Propre des Pseudo-Labels ---
+        # On ajoute les pseudo-labels UNIQUEMENT à l'entraînement, PAS à la validation
+        if pseudo_ds is not None:
+             final_train_ds = ConcatDataset([ds_train_fold, pseudo_ds])
+             desc_text = f"Expert {i+1} (Pro+Pseudo)"
+        else:
+             final_train_ds = ds_train_fold
+             desc_text = f"Expert {i+1}"
+
         train_loader = DataLoader(
-            Subset(train_ds, train_idx), batch_size=256, shuffle=True, 
+            final_train_ds, batch_size=BATCH_SIZE, shuffle=True, 
             num_workers=4, pin_memory=True, persistent_workers=True
         )
         
+        # Validation STRICTE sur les données d'origine seulement
         val_loader = DataLoader(
             Subset(train_ds, val_idx), batch_size=1024, shuffle=False, 
             num_workers=0, pin_memory=True
@@ -105,44 +124,63 @@ def train_experts_kfold(train_ds, device, num_experts=10, epochs=50):
 
         model = MNISTCNN().to(device)
         criterion = nn.CrossEntropyLoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=7, gamma=0.5)
+        
+        # OneCycleLR adapté au Batch Size
+        optimizer = optim.Adam(model.parameters(), lr=1e-3) 
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer, 
+            max_lr=0.01, 
+            steps_per_epoch=len(train_loader), 
+            epochs=epochs
+        )
 
         best_val_acc = 0.0
         total_steps = epochs * len(train_loader)
-        pbar = tqdm.tqdm(total=total_steps, desc=f"Expert {i+1}", unit="batch")
+        pbar = tqdm.tqdm(total=total_steps, desc=desc_text, unit="batch")
 
         for epoch in range(epochs):
             model.train()
             for images, labels in train_loader:
                 images, labels = images.to(device), labels.to(device)
                 optimizer.zero_grad()
-                outputs = model(images)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
+                
+                # --- AMP : Forward en float16 ---
+                with autocast():
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
+                
+                # --- AMP : Backward Scalé ---
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                scheduler.step()
                 pbar.update(1)
 
-            model.eval()
-            val_correct, val_total = 0, 0
-            val_pbar = tqdm.tqdm(val_loader, desc="   ↳ Examen", leave=False)
-            
-            with torch.no_grad():
-                for images, labels in val_pbar:
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(images)
-                    _, predicted = torch.max(outputs.data, 1)
-                    val_total += labels.size(0)
-                    val_correct += (predicted == labels).sum().item()
-            
-            val_acc = 100 * val_correct / val_total
-            pbar.set_postfix({"V_Acc": f"{val_acc:.2f}%", "Best": f"{best_val_acc:.2f}%"})
+            # --- Optimisation 3 : Validation Progressive ---
+            # On ne valide que tous les 5 epochs au début, puis à chaque fois à la fin
+            should_validate = (epoch >= 40) or (epoch % 5 == 0)
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                torch.save(model.state_dict(), f"expert_{i}.pth")
-            
-            scheduler.step()
+            if should_validate:
+                model.eval()
+                val_correct, val_total = 0, 0
+                
+                # Validation rapide (sans tqdm pour moins de spam console)
+                with torch.no_grad():
+                    for images, labels in val_loader:
+                        images, labels = images.to(device), labels.to(device)
+                        outputs = model(images)
+                        _, predicted = torch.max(outputs.data, 1)
+                        val_total += labels.size(0)
+                        val_correct += (predicted == labels).sum().item()
+                
+                val_acc = 100 * val_correct / val_total
+                pbar.set_postfix({"V_Acc": f"{val_acc:.2f}%", "Best": f"{best_val_acc:.2f}%"})
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    torch.save(model.state_dict(), f"expert_{i}.pth")
+        
         pbar.close()
 
 def predict_ensemble_tta(num_experts, device):
@@ -182,6 +220,49 @@ def predict_ensemble_tta(num_experts, device):
     pd.DataFrame({"ImageId": range(1, len(final_preds) + 1), "Label": final_preds.numpy()}).to_csv("submission_final.csv", index=False)
     print("\n🏆 Submission prête !")
 
+def generate_pseudo_labels(device, num_experts=10, threshold=0.999):
+    print(f"\n🏷️  Génération des Pseudo-Labels (Confiance > {threshold})...")
+    test_ds = MNISTDataset('./data/test.csv', is_test=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=0)
+    
+    # Mêmes TTA que pour la prédiction
+    tta_transforms = [
+        lambda x: x,
+        lambda x: transforms.functional.rotate(x, 5),
+        lambda x: transforms.functional.rotate(x, -5),
+    ]
+
+    all_expert_scores = None
+    for i in range(num_experts):
+        path = f"expert_{i}.pth"
+        if not os.path.exists(path): continue
+        model = MNISTCNN().to(device); model.load_state_dict(torch.load(path)); model.eval()
+        
+        expert_logits_list = []
+        with torch.no_grad():
+            for images in test_loader:
+                images = images.to(device)
+                batch_probs = torch.zeros((images.size(0), 10)).to(device)
+                for t in tta_transforms:
+                    augmented = torch.stack([t(img) for img in images])
+                    batch_probs += F.softmax(model(augmented), dim=1)
+                expert_logits_list.append(batch_probs.cpu() / len(tta_transforms))
+        
+        expert_avg = torch.cat(expert_logits_list)
+        all_expert_scores = expert_avg if all_expert_scores is None else all_expert_scores + expert_avg
+
+    # Moyenne de l'ensemble
+    final_probs = all_expert_scores / num_experts
+    max_probs, preds = torch.max(final_probs, dim=1)
+    
+    # Filtrage
+    mask = max_probs > threshold
+    pseudo_x = test_ds.x[mask]
+    pseudo_y = preds[mask]
+    
+    print(f"✅ {len(pseudo_x)} échantillons pseudo-labellisés ajoutés !")
+    return pseudo_x, pseudo_y
+
 # --- MAIN MIS À JOUR ---
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -197,7 +278,23 @@ def main():
             transforms.RandomAffine(0, translate=(0.1, 0.1)),
         ])
         train_ds = MNISTDataset('./data/train.csv', transform=train_transform)
+        
+        # 1. Premier Round : Entraînement Initial
+        print("\n🥊 ROUND 1 : Entraînement Initial")
         train_experts_kfold(train_ds, device, num_experts=num_experts, epochs=50)
+        
+        # 2. Pseudo-Labeling
+        print("\n🔮 PHASE SECRÈTE : Pseudo-Labeling")
+        pseudo_x, pseudo_y = generate_pseudo_labels(device, num_experts=num_experts)
+        
+        if len(pseudo_x) > 0:
+            # 3. Deuxième Round : Retraining avec Pseudo-Labels bien séparés
+            print("\n🥊 ROUND 2 : Fine-Tuning (Validation Sécurisée + AMP)")
+            pseudo_ds = MNISTDataset(data=pseudo_x, targets=pseudo_y, transform=train_transform)
+            
+            # On passe pseudo_ds en argument séparé pour ne PAS valider dessus
+            train_experts_kfold(train_ds, device, num_experts=num_experts, epochs=50, pseudo_ds=pseudo_ds)
+        
         predict_ensemble_tta(num_experts, device)
     
     elif choix == 'v':
